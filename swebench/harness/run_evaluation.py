@@ -67,6 +67,30 @@ GIT_APPLY_CMDS = [
     "patch --batch --fuzz=5 -p1 -i",
 ]
 
+DOCKER_PRE_PATCH = "/tmp/pre_patch.diff"
+
+
+def apply_patch_in_container(container, logger, instance_id, container_patch_path, label):
+    """Apply a patch file already copied into the container, trying GIT_APPLY_CMDS in order.
+    Raises EvaluationError if none succeed.
+    """
+    for git_apply_cmd in GIT_APPLY_CMDS:
+        val = container.exec_run(
+            f"{git_apply_cmd} {container_patch_path}",
+            workdir=DOCKER_WORKDIR,
+            user=DOCKER_USER,
+        )
+        if val.exit_code == 0:
+            logger.info(f"{label}: {APPLY_PATCH_PASS}:\n{val.output.decode(UTF8)}")
+            return
+        logger.info(f"{label}: failed to apply patch to container: {git_apply_cmd}")
+    logger.info(f"{label}: {APPLY_PATCH_FAIL}:\n{val.output.decode(UTF8)}")
+    raise EvaluationError(
+        instance_id,
+        f"{label}: {APPLY_PATCH_FAIL}:\n{val.output.decode(UTF8)}",
+        logger,
+    )
+
 
 def run_instance(
     test_spec: TestSpec,
@@ -77,6 +101,7 @@ def run_instance(
     run_id: str,
     timeout: int | None = None,
     rewrite_reports: bool = False,
+    pre_patch_file: str | None = None,
 ) -> dict:
     """
     Run a single instance with the given prediction.
@@ -90,6 +115,8 @@ def run_instance(
         run_id (str): Run ID
         timeout (int): Timeout for running tests
         rewrite_reports (bool): True if eval run is just to reformat existing report
+        pre_patch_file (str): Path to a patch applied to the checkout before the model
+            patch, to reproduce the (modified) state the prediction was generated against
     """
     # Set up logging directory
     instance_id = test_spec.instance_id
@@ -155,6 +182,17 @@ def run_instance(
         container.start()
         logger.info(f"Container for {instance_id} started: {container.id}")
 
+        # Apply the pre-patch (pre-experiment modification) BEFORE the model patch,
+        # so the checkout matches the state the prediction was generated against
+        if pre_patch_file:
+            pre_patch_copy = Path(log_dir / "pre_patch.diff")
+            pre_patch_copy.write_bytes(Path(pre_patch_file).read_bytes())
+            logger.info(
+                f"Pre-patch for {instance_id} copied to {pre_patch_copy}, now applying to container..."
+            )
+            copy_to_container(container, pre_patch_copy, PurePosixPath(DOCKER_PRE_PATCH))
+            apply_patch_in_container(container, logger, instance_id, DOCKER_PRE_PATCH, "PRE_PATCH")
+
         # Copy model prediction as patch file to container
         patch_file = Path(log_dir / "patch.diff")
         patch_file.write_text(pred[KEY_PREDICTION] or "")
@@ -164,26 +202,7 @@ def run_instance(
         copy_to_container(container, patch_file, PurePosixPath(DOCKER_PATCH))
 
         # Attempt to apply patch to container (TODO: FIX THIS)
-        applied_patch = False
-        for git_apply_cmd in GIT_APPLY_CMDS:
-            val = container.exec_run(
-                f"{git_apply_cmd} {DOCKER_PATCH}",
-                workdir=DOCKER_WORKDIR,
-                user=DOCKER_USER,
-            )
-            if val.exit_code == 0:
-                logger.info(f"{APPLY_PATCH_PASS}:\n{val.output.decode(UTF8)}")
-                applied_patch = True
-                break
-            else:
-                logger.info(f"Failed to apply patch to container: {git_apply_cmd}")
-        if not applied_patch:
-            logger.info(f"{APPLY_PATCH_FAIL}:\n{val.output.decode(UTF8)}")
-            raise EvaluationError(
-                instance_id,
-                f"{APPLY_PATCH_FAIL}:\n{val.output.decode(UTF8)}",
-                logger,
-            )
+        apply_patch_in_container(container, logger, instance_id, DOCKER_PATCH, "MODEL_PATCH")
 
         # Get git diff before running eval script
         git_diff_output_before = (
@@ -286,6 +305,7 @@ def run_instances(
     instance_image_tag: str = "latest",
     env_image_tag: str = "latest",
     rewrite_reports: bool = False,
+    pre_patch_file: str | None = None,
 ):
     """
     Run all instances for the given predictions in parallel.
@@ -344,6 +364,7 @@ def run_instances(
                 run_id,
                 timeout,
                 rewrite_reports,
+                pre_patch_file,
             )
         )
 
@@ -489,10 +510,13 @@ def main(
     instance_image_tag: str = "latest",
     env_image_tag: str = "latest",
     report_dir: str = ".",
+    pre_patch_file: str | None = None,
 ):
     """
     Run evaluation harness for the given dataset and predictions.
     """
+    if pre_patch_file and not Path(pre_patch_file).is_file():
+        raise FileNotFoundError(f"Pre-patch file not found: {pre_patch_file}")
     if dataset_name == "SWE-bench/SWE-bench_Multimodal" and split == "test":
         print(
             "⚠️ Local evaluation for the test split of SWE-bench Multimodal is not supported. "
@@ -522,6 +546,8 @@ def main(
 
     if modal:
         # run instances on Modal
+        if pre_patch_file:
+            raise ValueError("--pre-patch-file is not supported with Modal execution.")
         if not dataset:
             print("No instances to run.")
         else:
@@ -562,6 +588,7 @@ def main(
             instance_image_tag=instance_image_tag,
             env_image_tag=env_image_tag,
             rewrite_reports=rewrite_reports,
+            pre_patch_file=pre_patch_file,
         )
 
     # clean images + make final report
@@ -668,6 +695,14 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--report_dir", type=str, default=".", help="Directory to write reports to"
+    )
+    parser.add_argument(
+        "--pre-patch-file",
+        dest="pre_patch_file",
+        type=str,
+        default=None,
+        help="Path to a patch applied to the checkout before the model patch, "
+        "to reproduce the (modified) state the predictions were generated against",
     )
 
     # Modal execution args
